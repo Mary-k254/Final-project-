@@ -1,12 +1,13 @@
+import os
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
-import os
 from models import init_db, get_db_connection
 from ai_utils import init_ai_models, detect_mood_from_text, generate_chat_response
 from utils import generate_food_mood_insights, MOOD_EMOJIS
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+# Set secret key from environment variable or generate a random one
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
 # Initialize database and AI models
 init_db()
@@ -123,14 +124,14 @@ def log_food():
         calories = request.form.get('calories')
         
         if not food_name:
-            return render_template('log_food.html', error="Food name is required")
+            return render_template('log_food.html', username=session['username'], error="Food name is required")
         
         # Convert calories to int if provided
         if calories:
             try:
                 calories = int(calories)
             except ValueError:
-                return render_template('log_food.html', error="Calories must be a number")
+                return render_template('log_food.html', username=session['username'], error="Calories must be a number")
         else:
             calories = None
         
@@ -145,7 +146,7 @@ def log_food():
         
         return redirect(url_for('dashboard'))
     
-    return render_template('log_food.html')
+    return render_template('log_food.html', username=session['username'])
 
 @app.route('/log_mood', methods=['GET', 'POST'])
 def log_mood():
@@ -157,14 +158,14 @@ def log_mood():
         intensity = request.form['intensity']
         
         if not mood or not intensity:
-            return render_template('log_mood.html', error="All fields are required")
+            return render_template('log_mood.html', username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="All fields are required")
         
         try:
             intensity = int(intensity)
             if intensity < 1 or intensity > 5:
-                return render_template('log_mood.html', error="Intensity must be between 1 and 5")
+                return render_template('log_mood.html', username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be between 1 and 5")
         except ValueError:
-            return render_template('log_mood.html', error="Intensity must be a number")
+            return render_template('log_mood.html', username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be a number")
         
         # Insert mood log
         conn = get_db_connection()
@@ -177,7 +178,7 @@ def log_mood():
         
         return redirect(url_for('dashboard'))
     
-    return render_template('log_mood.html', moods=MOOD_EMOJIS.keys())
+    return render_template('log_mood.html', username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS)
 
 @app.route('/chat')
 def chat():
@@ -246,4 +247,5 @@ def insights():
     )
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
