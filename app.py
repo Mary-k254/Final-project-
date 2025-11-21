@@ -1,14 +1,28 @@
 import os
-import sqlite3
 import datetime
 import json
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
+from jinja2 import Template
 from werkzeug.security import generate_password_hash, check_password_hash
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-import torch
-import numpy as np
+from textblob import TextBlob
 from collections import defaultdict
 import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+import nltk
+
+load_dotenv()
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('corpora/brown')
+except LookupError:
+    nltk.download('brown')
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,7 +45,7 @@ MOOD_EMOJIS = {
     "neutral": "😐"
 }
 
-# HTML Templates (simplified for brevity - you can use the full templates from the previous code)
+# HTML Templates
 INDEX_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -61,27 +75,348 @@ INDEX_TEMPLATE = """
 </html>
 """
 
-# Add other templates similarly (LOGIN_TEMPLATE, SIGNUP_TEMPLATE, etc.) - use the full versions from previous code
+SIGNUP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign Up - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <h2 class="mb-4">Sign Up</h2>
+                {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-control" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Email</label>
+                        <input type="email" class="form-control" name="email" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Sign Up</button>
+                    <a href="/login" class="btn btn-link">Already have an account?</a>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <h2 class="mb-4">Login</h2>
+                {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-control" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Login</button>
+                    <a href="/signup" class="btn btn-link">Create an account</a>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+            <div class="ms-auto">
+                <span class="me-3">Welcome, {{ username }}!</span>
+                <a href="/logout" class="btn btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <div class="row">
+            <div class="col-md-4">
+                <a href="/log_food" class="btn btn-primary w-100 mb-2">Log Food</a>
+                <a href="/log_mood" class="btn btn-success w-100 mb-2">Log Mood</a>
+                <a href="/chat" class="btn btn-info w-100 mb-2">AI Chat</a>
+                <a href="/insights" class="btn btn-warning w-100">View Insights</a>
+            </div>
+            <div class="col-md-8">
+                <h3>Recent Food Logs</h3>
+                <ul class="list-group mb-4">
+                    {% for food in recent_foods %}
+                    <li class="list-group-item">{{ food['food_name'] }} - {{ food['calories'] or 'N/A' }} cal - {{ food['timestamp'] }}</li>
+                    {% endfor %}
+                    {% if not recent_foods %}
+                    <li class="list-group-item">No food logs yet</li>
+                    {% endif %}
+                </ul>
+                <h3>Recent Mood Logs</h3>
+                <ul class="list-group mb-4">
+                    {% for mood in recent_moods %}
+                    <li class="list-group-item">{{ mood_emojis[mood['mood']] }} {{ mood['mood'] }} ({{ mood['intensity'] }}/5) - {{ mood['timestamp'] }}</li>
+                    {% endfor %}
+                    {% if not recent_moods %}
+                    <li class="list-group-item">No mood logs yet</li>
+                    {% endif %}
+                </ul>
+                <h3>Insights</h3>
+                <ul class="list-group">
+                    {% for insight in insights %}
+                    <li class="list-group-item">{{ insight }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+LOG_FOOD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Log Food - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+            <div class="ms-auto">
+                <a href="/dashboard" class="btn btn-outline-primary me-2">Dashboard</a>
+                <a href="/logout" class="btn btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <h2 class="mb-4">Log Food</h2>
+                {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Food Name</label>
+                        <input type="text" class="form-control" name="food_name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Calories (optional)</label>
+                        <input type="number" class="form-control" name="calories">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Log Food</button>
+                    <a href="/dashboard" class="btn btn-secondary">Cancel</a>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+LOG_MOOD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Log Mood - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+            <div class="ms-auto">
+                <a href="/dashboard" class="btn btn-outline-primary me-2">Dashboard</a>
+                <a href="/logout" class="btn btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <div class="row justify-content-center">
+            <div class="col-md-6">
+                <h2 class="mb-4">Log Mood</h2>
+                {% if error %}
+                <div class="alert alert-danger">{{ error }}</div>
+                {% endif %}
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Mood</label>
+                        <select class="form-select" name="mood" required>
+                            {% for mood in moods %}
+                            <option value="{{ mood }}">{{ mood_emojis[mood] }} {{ mood }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Intensity (1-5)</label>
+                        <input type="number" class="form-control" name="intensity" min="1" max="5" required>
+                    </div>
+                    <button type="submit" class="btn btn-success">Log Mood</button>
+                    <a href="/dashboard" class="btn btn-secondary">Cancel</a>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+CHAT_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Chat - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+            <div class="ms-auto">
+                <a href="/dashboard" class="btn btn-outline-primary me-2">Dashboard</a>
+                <a href="/logout" class="btn btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <h2 class="mb-4">AI Chat</h2>
+        <div id="chat-history" class="mb-4" style="height: 400px; overflow-y: scroll; border: 1px solid #ddd; padding: 15px;">
+            {% for chat in chat_history %}
+            <div class="mb-3">
+                <strong>You:</strong> {{ chat['message'] }}<br>
+                <strong>AI {{ mood_emojis[chat['detected_mood']] }}:</strong> {{ chat['response'] }}
+            </div>
+            {% endfor %}
+        </div>
+        <div class="input-group">
+            <input type="text" id="message-input" class="form-control" placeholder="Type your message...">
+            <button onclick="sendMessage()" class="btn btn-primary">Send</button>
+        </div>
+    </div>
+    <script>
+    function sendMessage() {
+        const input = document.getElementById('message-input');
+        const message = input.value;
+        if (!message) return;
+
+        fetch('/api/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: message})
+        })
+        .then(res => res.json())
+        .then(data => {
+            const chatHistory = document.getElementById('chat-history');
+            chatHistory.innerHTML += `<div class="mb-3"><strong>You:</strong> ${message}<br><strong>AI ${data.mood_emoji}:</strong> ${data.response}</div>`;
+            chatHistory.scrollTop = chatHistory.scrollHeight;
+            input.value = '';
+        });
+    }
+    document.getElementById('message-input').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') sendMessage();
+    });
+    </script>
+</body>
+</html>
+"""
+
+INSIGHTS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Insights - Mood Bite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="/">Mood Bite</a>
+            <div class="ms-auto">
+                <a href="/dashboard" class="btn btn-outline-primary me-2">Dashboard</a>
+                <a href="/logout" class="btn btn-outline-danger">Logout</a>
+            </div>
+        </div>
+    </nav>
+    <div class="container my-5">
+        <h2 class="mb-4">Your Insights</h2>
+        <ul class="list-group">
+            {% for insight in insights %}
+            <li class="list-group-item">{{ insight }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+</body>
+</html>
+"""
 
 # Database functions
+def get_database_url():
+    return os.environ.get('DATABASE_URL', 'postgresql://localhost/mood_bite')
+
 def init_db():
-    conn = sqlite3.connect('mood_bite.db')
+    database_url = get_database_url()
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+
+    conn = psycopg2.connect(database_url)
     cursor = conn.cursor()
-    
-    # Create tables
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
-    
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS food_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         food_name TEXT NOT NULL,
         calories INTEGER,
@@ -89,10 +424,10 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (id)
     )
     ''')
-    
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS mood_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         mood TEXT NOT NULL,
         intensity INTEGER NOT NULL,
@@ -100,10 +435,10 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (id)
     )
     ''')
-    
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chat_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
         message TEXT NOT NULL,
         response TEXT NOT NULL,
@@ -112,58 +447,45 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (id)
     )
     ''')
-    
+
     conn.commit()
     conn.close()
 
 def get_db_connection():
-    conn = sqlite3.connect('mood_bite.db')
-    conn.row_factory = sqlite3.Row
+    database_url = get_database_url()
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+
+    conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
     return conn
 
-# AI functions
-def init_ai_models():
+# AI functions using TextBlob
+def detect_mood_from_text(text):
     try:
-        logger.info("Loading sentiment analysis model...")
-        sentiment_model = pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            tokenizer="distilbert-base-uncased-finetuned-sst-2-english"
-        )
-        logger.info("Sentiment analysis model loaded successfully.")
-        
-        logger.info("Loading emotion detection model...")
-        emotion_tokenizer = AutoTokenizer.from_pretrained("bhadresh-savani/bert-base-uncased-emotion")
-        emotion_model = AutoModelForSequenceClassification.from_pretrained("bhadresh-savani/bert-base-uncased-emotion")
-        logger.info("Emotion detection model loaded successfully.")
-        
-        return sentiment_model, emotion_tokenizer, emotion_model
-    except Exception as e:
-        logger.error(f"Error loading AI models: {str(e)}")
-        raise
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        subjectivity = blob.sentiment.subjectivity
 
-def detect_mood_from_text(text, sentiment_model, emotion_tokenizer, emotion_model):
-    try:
-        sentiment_result = sentiment_model(text)[0]
-        sentiment = sentiment_result['label']
-        score = sentiment_result['score']
-        
-        inputs = emotion_tokenizer(text, return_tensors="pt")
-        outputs = emotion_model(**inputs)
-        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        emotions = emotion_model.config.id2label
-        emotion = emotions[torch.argmax(predictions).item()]
-        
-        if emotion == "joy" or (sentiment == "POSITIVE" and score > 0.8):
-            return "happy"
-        elif emotion == "sadness" or (sentiment == "NEGATIVE" and score > 0.8):
-            return "sad"
-        elif emotion == "anger":
+        # Check for specific keywords
+        text_lower = text.lower()
+        if any(word in text_lower for word in ['angry', 'furious', 'mad', 'annoyed']):
             return "angry"
-        elif emotion == "fear":
+        elif any(word in text_lower for word in ['anxious', 'worried', 'nervous', 'scared', 'afraid']):
             return "anxious"
-        elif emotion == "love":
+        elif any(word in text_lower for word in ['tired', 'exhausted', 'sleepy', 'fatigue']):
+            return "tired"
+        elif any(word in text_lower for word in ['excited', 'thrilled', 'enthusiastic']):
             return "excited"
+        elif any(word in text_lower for word in ['calm', 'peaceful', 'relaxed']):
+            return "calm"
+
+        # Use polarity for general sentiment
+        if polarity > 0.5:
+            return "happy"
+        elif polarity < -0.3:
+            return "sad"
+        elif polarity > 0.2:
+            return "calm"
         else:
             return "neutral"
     except Exception as e:
@@ -239,21 +561,16 @@ def generate_food_mood_insights(user_id):
     conn.close()
     return insights
 
-# Initialize database and AI models
-init_db()
+# AI models are now lightweight (TextBlob)
+ai_models_loaded = True
 
-# Initialize AI models with error handling
+# Initialize database
 try:
-    logger.info("Initializing AI models...")
-    sentiment_model, emotion_tokenizer, emotion_model = init_ai_models()
-    ai_models_loaded = True
-    logger.info("AI models initialized successfully.")
+    init_db()
+    logger.info("Database initialized successfully.")
 except Exception as e:
-    logger.error(f"Failed to initialize AI models: {str(e)}")
-    ai_models_loaded = False
-    sentiment_model = None
-    emotion_tokenizer = None
-    emotion_model = None
+    logger.error(f"Failed to initialize database: {str(e)}")
+    logger.error("App will continue but may not function properly without database.")
 
 # Routes
 @app.route('/')
@@ -268,15 +585,15 @@ def signup():
         username = request.form['username']
         email = request.form['email']
         password = request.form['password']
-        
+
         if not username or not email or not password:
-            return render_template_string(SIGNUP_TEMPLATE, error="All fields are required")
-        
+            return Template(SIGNUP_TEMPLATE).render(error="All fields are required")
+
         if len(password) < 6:
-            return render_template_string(SIGNUP_TEMPLATE, error="Password must be at least 6 characters")
-        
+            return Template(SIGNUP_TEMPLATE).render(error="Password must be at least 6 characters")
+
         hashed_password = generate_password_hash(password)
-        
+
         conn = get_db_connection()
         try:
             conn.execute(
@@ -286,33 +603,33 @@ def signup():
             conn.commit()
             conn.close()
             return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             conn.close()
-            return render_template_string(SIGNUP_TEMPLATE, error="Username or email already exists")
-    
-    return render_template_string(SIGNUP_TEMPLATE)
+            return Template(SIGNUP_TEMPLATE).render(error="Username or email already exists")
+
+    return Template(SIGNUP_TEMPLATE).render(error=None)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        
+
         conn = get_db_connection()
         user = conn.execute(
             'SELECT * FROM users WHERE username = ?',
             (username,)
         ).fetchone()
         conn.close()
-        
+
         if user and check_password_hash(user['password'], password):
             session['user_id'] = user['id']
             session['username'] = user['username']
             return redirect(url_for('dashboard'))
         else:
-            return render_template_string(LOGIN_TEMPLATE, error="Invalid username or password")
-    
-    return render_template_string(LOGIN_TEMPLATE)
+            return Template(LOGIN_TEMPLATE).render(error="Invalid username or password")
+
+    return Template(LOGIN_TEMPLATE).render(error=None)
 
 @app.route('/logout')
 def logout():
@@ -341,8 +658,7 @@ def dashboard():
     
     conn.close()
     
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
+    return Template(DASHBOARD_TEMPLATE).render(
         username=session['username'],
         recent_foods=recent_foods,
         recent_moods=recent_moods,
@@ -360,16 +676,16 @@ def log_food():
         calories = request.form.get('calories')
         
         if not food_name:
-            return render_template_string(LOG_FOOD_TEMPLATE, username=session['username'], error="Food name is required")
-        
+            return Template(LOG_FOOD_TEMPLATE).render(username=session['username'], error="Food name is required")
+
         if calories:
             try:
                 calories = int(calories)
             except ValueError:
-                return render_template_string(LOG_FOOD_TEMPLATE, username=session['username'], error="Calories must be a number")
+                return Template(LOG_FOOD_TEMPLATE).render(username=session['username'], error="Calories must be a number")
         else:
             calories = None
-        
+
         conn = get_db_connection()
         conn.execute(
             'INSERT INTO food_logs (user_id, food_name, calories) VALUES (?, ?, ?)',
@@ -377,10 +693,10 @@ def log_food():
         )
         conn.commit()
         conn.close()
-        
+
         return redirect(url_for('dashboard'))
-    
-    return render_template_string(LOG_FOOD_TEMPLATE, username=session['username'])
+
+    return Template(LOG_FOOD_TEMPLATE).render(username=session['username'], error=None)
 
 @app.route('/log_mood', methods=['GET', 'POST'])
 def log_mood():
@@ -392,15 +708,15 @@ def log_mood():
         intensity = request.form['intensity']
         
         if not mood or not intensity:
-            return render_template_string(LOG_MOOD_TEMPLATE, username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="All fields are required")
-        
+            return Template(LOG_MOOD_TEMPLATE).render(username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="All fields are required")
+
         try:
             intensity = int(intensity)
             if intensity < 1 or intensity > 5:
-                return render_template_string(LOG_MOOD_TEMPLATE, username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be between 1 and 5")
+                return Template(LOG_MOOD_TEMPLATE).render(username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be between 1 and 5")
         except ValueError:
-            return render_template_string(LOG_MOOD_TEMPLATE, username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be a number")
-        
+            return Template(LOG_MOOD_TEMPLATE).render(username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error="Intensity must be a number")
+
         conn = get_db_connection()
         conn.execute(
             'INSERT INTO mood_logs (user_id, mood, intensity) VALUES (?, ?, ?)',
@@ -408,10 +724,10 @@ def log_mood():
         )
         conn.commit()
         conn.close()
-        
+
         return redirect(url_for('dashboard'))
-    
-    return render_template_string(LOG_MOOD_TEMPLATE, username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS)
+
+    return Template(LOG_MOOD_TEMPLATE).render(username=session['username'], moods=MOOD_EMOJIS.keys(), mood_emojis=MOOD_EMOJIS, error=None)
 
 @app.route('/chat')
 def chat():
@@ -427,8 +743,7 @@ def chat():
     
     chat_history = list(reversed(chat_history))
     
-    return render_template_string(
-        CHAT_TEMPLATE,
+    return Template(CHAT_TEMPLATE).render(
         username=session['username'],
         chat_history=chat_history,
         mood_emojis=MOOD_EMOJIS
@@ -443,15 +758,8 @@ def api_chat():
     if not user_message:
         return jsonify({"error": "Message is required"}), 400
     
-    if not ai_models_loaded:
-        return jsonify({
-            "response": "I'm sorry, the AI models are currently unavailable. Please try again later.",
-            "detected_mood": "neutral",
-            "mood_emoji": MOOD_EMOJIS.get("neutral", "😐")
-        })
-    
     try:
-        detected_mood = detect_mood_from_text(user_message, sentiment_model, emotion_tokenizer, emotion_model)
+        detected_mood = detect_mood_from_text(user_message)
         response = generate_chat_response(user_message, detected_mood)
         
         conn = get_db_connection()
@@ -483,8 +791,7 @@ def insights():
     user_id = session['user_id']
     insights = generate_food_mood_insights(user_id)
     
-    return render_template_string(
-        INSIGHTS_TEMPLATE,
+    return Template(INSIGHTS_TEMPLATE).render(
         username=session['username'],
         insights=insights
     )
@@ -499,7 +806,9 @@ def health_check():
     
     try:
         conn = get_db_connection()
-        conn.execute('SELECT 1')
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1')
+        cursor.close()
         conn.close()
     except Exception as e:
         status["database"] = f"error: {str(e)}"
